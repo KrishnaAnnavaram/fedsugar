@@ -1,0 +1,35 @@
+# secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# local data: never commit survey files or downloads
+/data/*
+!/data/README.md
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+
+# experiment outputs and model files
+/runs/
+/reports/
+/models/
+*.npz
+*.npy
+*.pkl
+*.joblib
+*.pt
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/

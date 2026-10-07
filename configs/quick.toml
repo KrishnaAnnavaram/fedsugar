@@ -1,0 +1,11 @@
+# Small sweep for a fast check on synthetic data. Run: fedsugar sweep --config configs/quick.toml
+[grid]
+seeds = [1, 2]
+schemes = ["iid", "dirichlet"]
+alphas = [0.5]
+clients = [5]
+strategies = ["fedavg"]
+models = ["logreg"]
+
+[train]
+rounds = 10

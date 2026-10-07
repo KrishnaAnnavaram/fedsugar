@@ -1,0 +1,15 @@
+# Full sweep for the real BRFSS file. Run: fedsugar sweep --config configs/sweep.toml
+[grid]
+seeds = [1, 2, 3, 4, 5]
+schemes = ["iid", "dirichlet", "silo"]
+alphas = [0.1, 0.5, 1.0, 100.0]
+clients = [5, 10]
+strategies = ["fedavg", "fedprox", "fedadam"]
+models = ["logreg", "mlp"]
+
+[train]
+rounds = 30
+local_epochs = 1
+lr = 0.05
+batch_size = 64
+class_weight = "global"

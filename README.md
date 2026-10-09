@@ -68,6 +68,7 @@ This README is the **one location that explains all of fedsugar**. It gives thes
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one federated round](#42-the-life-cycle-of-one-federated-round)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Data, split and partition](#5-data-split-and-partition)
 6. 🟢 [Models and centralized training](#6-models-and-centralized-training)
 7. 🟣 [Federated training](#7-federated-training)
@@ -131,6 +132,42 @@ flowchart LR
 | Flower adapter (optional) | `src/fedsugar/flower_app.py` | The same clients as Flower `NumPyClient` objects |
 | CLI | `src/fedsugar/cli.py` | The `fedsugar` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>fedsugar command"]
+    CFG["config.py<br/>Settings.from_env"]
+    subgraph DATAG["Data"]
+        DAT["data.py<br/>load, validate, scale, split"]
+        SYN["synthetic.py<br/>generate, write"]
+        PAR["partition.py<br/>make_partition, class_table,<br/>label_skew"]
+    end
+    subgraph TRAIN["Training"]
+        TRN["training.py<br/>TrainConfig, train_centralized,<br/>train_federated, Client"]
+        MOD["models.py<br/>make_model, sgd_epochs,<br/>balanced_class_weights"]
+        MET["metrics.py<br/>evaluate, paired_bootstrap_f1,<br/>mean_ci"]
+    end
+    EXP["experiments.py<br/>compare, run_grid, summarize"]
+    FL["flower_app.py<br/>make_numpy_client, run_simulation,<br/>extra flower"]
+
+    CLI --> CFG
+    CLI --> DAT
+    CLI --> SYN
+    CLI --> EXP
+    CLI --> TRN
+    EXP --> DAT
+    EXP --> PAR
+    EXP --> TRN
+    EXP --> MET
+    TRN --> MOD
+    TRN --> MET
+    SYN --> DAT
+    FL --> TRN
+    FL --> MOD
+    FL --> MET
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -181,6 +218,27 @@ Each client starts each round from the current global weights and trains `local_
 ### 3.4 A data-free server
 `models.make_model` takes the number of features and a seed, not data. `data.scale` uses the documented range of each indicator, so no statistic of the records is needed.
 
+The diagram shows what goes between the server and one client. No record goes to the server.
+
+```mermaid
+flowchart LR
+    subgraph SERVER["Server: no records"]
+        INIT["make_model:<br/>n_features and seed only"]
+        CW["balanced_class_weights<br/>from the summed counts"]
+        AGG["aggregate the updates"]
+    end
+    subgraph CLIENTK["Client k: keeps its X and y"]
+        LC["label_counts"]
+        FIT["Client.fit:<br/>local SGD on its own records"]
+    end
+    SC["data.scale: documented<br/>min and max of each indicator"] --> FIT
+    INIT -- "global weights" --> FIT
+    LC -- "label counts, one time,<br/>class_weight global" --> CW
+    CW -- "class weights" --> FIT
+    FIT -- "new weights, row count" --> AGG
+    AGG -- "next global weights" --> FIT
+```
+
 ### 3.5 Measured time and bytes
 `training.py` measures each client fit and each aggregation with `time.perf_counter`. It reports the sequential time and the parallel time. Communication counts 4 bytes for each parameter, in both directions.
 
@@ -200,8 +258,11 @@ The `fedsugar` command runs every step. The grid in `configs/sweep.toml` runs ev
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    F["survey file"] --> V["column contract + ranges"]
+flowchart TD
+    SRC{"Data source"} -- "survey file" --> F[/"BRFSS 2015 CSV<br/>21 indicators + Diabetes_012"/]
+    SRC -- "fedsugar synth" --> SY[/"synthetic rows"/]
+    F --> V["column contract + ranges"]
+    SY --> V
     V --> SC["range scaling (no data statistics)"]
     SC --> SP["stratified split 70 / 15 / 15"]
     SP --> TR["train records"]
@@ -220,9 +281,37 @@ flowchart TB
     SEL --> EVAL["test metrics"]
     TE --> EVAL
     EVAL --> CMP["paired bootstrap + mean and t interval over seeds"]
+    CMP --> OUT[("runs/<br/>compare.csv, runs.csv, summary.csv")]
+    OUT --> HUMAN{{"HUMAN<br/>researcher checks the recall by group,<br/>a clinician reviews any health use"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one federated round
+
+```mermaid
+stateDiagram-v2
+    state "Clients selected" as Selected
+    state "Local training on each client" as Local
+    state "Updates received" as Update
+    state "Updates clipped and noised" as Clipped
+    state "Weighted mean update" as Mean
+    state "Global weights changed" as Applied
+    state "Validated" as Validated
+    state "Best round kept" as Best
+    [*] --> Selected: rng.choice, client_fraction
+    Selected --> Local: global weights sent, set_weights
+    Local --> Update: new weights minus global weights, row count
+    Update --> Clipped: dp_clip set
+    Update --> Mean: dp_clip not set
+    Clipped --> Mean
+    Mean --> Applied: add the mean, or an Adam step for fedadam
+    Applied --> Validated: evaluate on the validation records
+    Validated --> Best: macro-F1 better than the best
+    Validated --> [*]: not better
+    Best --> [*]
+```
 
 1. The server chooses the clients for the round (all clients, or a fraction).
 2. The server sends the global weights to each chosen client.
@@ -234,11 +323,83 @@ flowchart TB
 8. The server applies the mean update (FedAvg, FedProx) or an Adam step (FedAdam).
 9. The server evaluates the new weights on the validation records and keeps the best round.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as fedsugar CLI
+    participant D as data.py
+    participant X as experiments.compare
+    participant C as train_centralized
+    participant S as Server, train_federated
+    participant K as Clients
+    participant M as metrics.py
+
+    R->>CLI: fedsugar compare --scheme dirichlet --alpha 0.5 --clients 5
+    CLI->>D: load: validate the column contract
+    CLI->>X: compare(frame, TrainConfig)
+    X->>D: split: stratified 70 / 15 / 15
+    X->>X: make_clients: make_partition, class_table, label_skew
+    X->>C: train on all train records
+    C->>M: evaluate on validation after each epoch
+    C-->>X: best-epoch model and test metrics
+    X->>S: train_federated(clients, TrainConfig)
+    K-->>S: label counts, one time, for global class weights
+    loop each round
+        S->>K: global weights
+        K->>K: Client.fit, local SGD
+        K-->>S: new weights and row count
+        S->>S: clip and noise if set, weighted mean, strategy step
+        S->>M: evaluate on validation
+    end
+    S-->>X: best-round model, times, communication
+    X->>X: train_local_only, hgb_baseline
+    X->>M: paired_bootstrap_f1, federated minus centralized
+    X-->>CLI: table, clients, interval
+    CLI-->>R: printed tables, CSV files with --out
+```
+
 ---
 
 ## 5. Data, split and partition
 
 **Purpose.** Load the survey file safely, make one split and give each client its records.
+
+```mermaid
+flowchart TD
+    CSV[/"CSV file"/] --> COLS{"All 21 indicators<br/>and Diabetes_012?"}
+    COLS -- "no" --> ERR[/"SchemaError"/]
+    COLS -- "yes" --> NUM{"All values numbers?"}
+    NUM -- "no" --> ERR
+    NUM -- "yes" --> RNG{"Each column in its<br/>documented range?"}
+    RNG -- "no" --> ERR
+    RNG -- "yes" --> WH{"Binary and ordinal columns<br/>whole numbers, target 0, 1 or 2?"}
+    WH -- "no" --> ERR
+    WH -- "yes" --> S1["train_test_split: 15 % test,<br/>stratified, seed"]
+    S1 --> S2["train_test_split: 15 % validation<br/>from the rest, stratified, seed"]
+    S2 --> SC["scale: value − min, divided by max − min,<br/>with the SCHEMA limits"]
+    SC --> OUT[/"Split: X and y for train, validation<br/>and test, + train_frame"/]
+```
+
+`partition.make_partition` gives the training records to the clients:
+
+```mermaid
+flowchart TD
+    IN[/"y_train, train_frame,<br/>clients, alpha, seed"/] --> S{"scheme"}
+    S -- "iid" --> IID["random permutation,<br/>array_split in equal parts"]
+    IID --> PARTS[/"one index array for each client"/]
+    S -- "dirichlet" --> DIR["for each class: shares from<br/>Dirichlet(alpha), cut the members"]
+    DIR --> MIN{"Each client has<br/>min_size records?"}
+    MIN -- "no, less than 100 tries" --> DIR
+    MIN -- "no, after 100 tries" --> RE[/"RuntimeError"/]
+    MIN -- "yes" --> PARTS
+    S -- "silo" --> SILO["rank one indicator, default Age,<br/>quantile bins"]
+    SILO --> PARTS
+    PARTS --> CT["class_table: records of<br/>each class on each client"]
+    PARTS --> LS["label_skew: mean total-variation<br/>distance to the global mix"]
+```
 
 | Input | Output |
 |---|---|
@@ -270,6 +431,24 @@ flowchart TB
 
 **Purpose.** Train one differentiable model on all training records, with the same settings that the clients use.
 
+```mermaid
+flowchart TD
+    IN[/"train, validation and test arrays,<br/>TrainConfig"/] --> MK["make_model from the seed"]
+    MK --> CW{"class_weight none?"}
+    CW -- "yes" --> ONE["all class weights 1"]
+    CW -- "no" --> BAL["n / (3 n_k) from the<br/>training counts"]
+    ONE --> EP["one epoch of sgd_epochs,<br/>timed with perf_counter"]
+    BAL --> EP
+    EP --> VAL["evaluate on validation"]
+    VAL --> B{"Validation macro-F1<br/>better than the best?"}
+    B -- "yes" --> KEEP["keep the weights<br/>and the epoch"]
+    B -- "no" --> MORE{"Epochs left?<br/>rounds × local_epochs"}
+    KEEP --> MORE
+    MORE -- "yes" --> EP
+    MORE -- "no" --> BEST["set the best weights"]
+    BEST --> OUT[/"TrainResult: test metrics,<br/>history, train_seconds"/]
+```
+
 | Input | Output |
 |---|---|
 | Train and validation arrays, a `TrainConfig` | The model of the best epoch, test metrics, the history, the measured time |
@@ -292,11 +471,49 @@ flowchart TB
 | `logreg` | 66 |
 | `mlp` (32 hidden units) | 803 |
 
+The two models share one loss and one optimizer:
+
+```mermaid
+flowchart LR
+    SEED[/"model name, n_features, seed"/] --> MK{"make_model"}
+    MK -- "logreg" --> LR["SoftmaxRegression:<br/>W 21 × 3, b 3, 66 parameters"]
+    MK -- "mlp" --> MLP["MLP: 32 ReLU units,<br/>803 parameters"]
+    LR --> LG["loss_and_grad: class-weighted<br/>cross-entropy + l2 1e-4, exact gradients"]
+    MLP --> LG
+    LG --> SGD["sgd_epochs: shuffled mini-batches,<br/>w = w − lr × grad"]
+    PROX[/"prox_mu and global weights,<br/>FedProx only"/] --> SGD
+```
+
 ---
 
 ## 7. Federated training
 
 **Purpose.** Train the same model with clients that keep their records.
+
+```mermaid
+flowchart TD
+    IN[/"clients, validation and test<br/>arrays, TrainConfig"/] --> INIT["make_model from the seed,<br/>no data"]
+    INIT --> CWM{"class_weight"}
+    CWM -- "global" --> GL["sum the label counts of the clients,<br/>balanced_class_weights"]
+    CWM -- "none" --> NO["all class weights 1"]
+    CWM -- "local" --> LO["each client uses<br/>its own counts"]
+    GL --> RND["round: choose client_fraction × clients,<br/>at least 1"]
+    NO --> RND
+    LO --> RND
+    RND --> FIT["Client.fit for each chosen client,<br/>time each fit"]
+    FIT --> DP{"dp_clip set?"}
+    DP -- "yes" --> CLIP["_clip_and_noise: clip the norm,<br/>add Gaussian noise"]
+    DP -- "no" --> MEAN["weighted mean of the updates,<br/>weights n_k / n"]
+    CLIP --> MEAN
+    MEAN --> ST{"strategy"}
+    ST -- "fedavg or fedprox" --> ADD["add the mean update"]
+    ST -- "fedadam" --> ADAM["Adam step: beta1 0.9, beta2 0.99,<br/>tau 1e-3, server_lr"]
+    ADD --> EV["evaluate on validation,<br/>keep the best round"]
+    ADAM --> EV
+    EV --> MORE{"Rounds left?"}
+    MORE -- "yes" --> RND
+    MORE -- "no" --> OUT[/"TrainResult: test metrics, sequential<br/>and parallel time, comm_megabytes"/]
+```
 
 | Input | Output |
 |---|---|
@@ -322,9 +539,70 @@ flowchart TB
 | `local` | The label counts of each client | No, each client has its own weights |
 | `none` | All weights 1 | Yes, with `none` in both |
 
+One client in one round (`Client.fit`):
+
+```mermaid
+flowchart LR
+    GW[/"global weights, round,<br/>class weights"/] --> NEW["make_model, set_weights"]
+    NEW --> CWQ{"Class weights<br/>from the server?"}
+    OWN["balanced weights from its own<br/>label counts, 0 for a missing class"]
+    RNG["rng from the seed,<br/>the round and the client ID"]
+    CWQ -- "no, local" --> OWN
+    CWQ -- "yes" --> RNG
+    OWN --> RNG
+    RNG --> SGD["sgd_epochs: local_epochs,<br/>prox_mu only for fedprox"]
+    SGD --> OUT[/"new weights and the last loss"/]
+```
+
+The optional Flower adapter wraps the same clients:
+
+```mermaid
+flowchart LR
+    CL[/"fedsugar Client objects"/] --> RS["run_simulation: Flower FedAvg,<br/>fraction_fit = client_fraction"]
+    RS --> NC["make_numpy_client:<br/>FedsugarNumPyClient"]
+    NC --> GP["get_parameters:<br/>initial model from the seed"]
+    NC --> FT["fit: Client.fit with server_round,<br/>returns weights and row count"]
+    NC --> EV["evaluate: loss and macro-F1<br/>on the client records"]
+    RS --> H[/"Flower history"/]
+```
+
 ---
 
 ## 8. Metrics, comparison rules and responsible use
+
+`experiments.compare` makes the single-split comparison:
+
+```mermaid
+flowchart TD
+    IN[/"table and TrainConfig"/] --> SP["split with cfg.seed"]
+    SP --> MC["make_clients: partition,<br/>class_table, label_skew"]
+    SP --> CEN["train_centralized"]
+    MC --> FED["train_federated"]
+    MC --> LOC["train_local_only: each client alone,<br/>mean test metrics"]
+    SP --> HGB["hgb_baseline: HistGradientBoosting,<br/>balanced, centralized reference"]
+    CEN --> PB["paired_bootstrap_f1: federated minus<br/>centralized, 1,000 draws, 95 %"]
+    FED --> PB
+    CEN --> TBL[/"table: centralized, federated,<br/>local_only_mean, centralized_hgb"/]
+    FED --> TBL
+    LOC --> TBL
+    HGB --> TBL
+    PB --> DIFF[/"fed_minus_central_macro_f1"/]
+```
+
+`experiments.run_grid` runs a TOML grid and summarizes it over seeds:
+
+```mermaid
+flowchart TD
+    TOML[/"TOML file: grid and train tables"/] --> LG{"load_grid: seeds, schemes, alphas,<br/>clients, strategies, models?"}
+    LG -- "a key is missing" --> ERR[/"ValueError"/]
+    LG -- "yes" --> SEED["for each seed: one split"]
+    SEED --> PART["for each scheme, alpha and client count:<br/>alpha only for dirichlet"]
+    PART --> MOD["for each model:<br/>train_centralized one time"]
+    MOD --> STR["for each strategy:<br/>train_federated"]
+    STR --> RUNS[("runs.csv: one row for each<br/>setting and seed")]
+    RUNS --> SUM["summarize: mean_ci over seeds,<br/>federated minus centralized"]
+    SUM --> SUMM[("summary.csv: means and<br/>95 % t intervals")]
+```
 
 | Rule | Value | Code |
 |---|---|---|
@@ -415,15 +693,44 @@ pytest -q
 | `sweep` | Runs a TOML grid and writes `runs.csv` and `summary.csv` |
 | `demo` | Synthetic rows, one comparison, a run without class weights and a small grid |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> DEMO["fedsugar demo<br/>writes runs/demo"]
+    INS --> SYN["fedsugar synth"]
+    DL[/"survey file,<br/>see data/README.md"/] --> DATA[("data/*.csv")]
+    SYN --> DATA
+    DATA --> PART["fedsugar partition"]
+    DATA --> CEN["fedsugar centralized"]
+    DATA --> FED["fedsugar federated"]
+    DATA --> CMP["fedsugar compare"]
+    DATA --> SW["fedsugar sweep"]
+    TOML[("configs/sweep.toml<br/>configs/quick.toml")] --> SW
+    FED -- "--history" --> H[("history CSV")]
+    CMP -- "--out" --> RC[("compare.csv,<br/>history_centralized.csv,<br/>history_federated.csv")]
+    SW --> RS[("runs.csv, summary.csv")]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
 |---|---|---|
 | `FEDSUGAR_DATA` | all training commands | Path of the survey file, default `data/diabetes_012_health_indicators_BRFSS2015.csv` |
-| `FEDSUGAR_OUTPUT_DIR` | settings | Output folder, default `runs` |
+| `FEDSUGAR_OUTPUT_DIR` | settings | Output folder, default `runs`. No command reads it at this time: `compare`, `sweep` and `demo` use `--out` |
 | `FEDSUGAR_SEED` | `centralized`, `federated`, `compare` | Seed when `--seed` is not given, default `42` |
 
-fedsugar needs no credentials. Keep local settings in a `.env` file. Git ignores this file.
+fedsugar needs no credentials. Keep local settings in a `.env` file. Git ignores this file. fedsugar does not read the `.env` file itself: load it into the shell environment before you run a command.
+
+```mermaid
+flowchart LR
+    ENV[/"FEDSUGAR_DATA, FEDSUGAR_OUTPUT_DIR,<br/>FEDSUGAR_SEED"/] --> FE["Settings.from_env"]
+    FE --> INT{"FEDSUGAR_SEED empty<br/>or an integer?"}
+    INT -- "no" --> ERR[/"ValueError"/]
+    INT -- "yes" --> SET[/"Settings: data, output_dir, seed"/]
+    SET --> DATA["_data: --data, else Settings.data"]
+    SET --> SEED["_config: --seed, else Settings.seed"]
+```
 
 ---
 
